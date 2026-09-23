@@ -11,9 +11,9 @@ It has five parts. Read only the parts the current task needs, not the whole fil
 - Part 5 — Implementation plan (tasks T-01 to T-29, each with its requirements and tests)
 
 ## Stack
-- Java 21, Spring Boot 3.x, Maven
+- Java 21, Spring Boot 4.1, Maven (spec D30)
 - MySQL 8.0.16+ (InnoDB, utf8mb4); Flyway for migrations
-- Tests: JUnit 5, Testcontainers (real MySQL), MinIO container for image storage
+- Tests: JUnit 5 against a locally installed MySQL (database `catalog_test`). MySQL is the only service the project needs (spec D28, D29)
 - Stock events: RabbitMQ (see spec Part 3, section 10)
 
 ## Workflow rules
@@ -29,11 +29,23 @@ It has five parts. Read only the parts the current task needs, not the whole fil
 - **Comment code inline**, explaining *why*, not just *what*, so a reader can follow the reasoning.
 - Every test method name includes its test ID, e.g. `TC_CAT_032_01_saleActiveDuringWindow`.
 - Never edit an existing Flyway migration. Schema changes are always a new migration file.
-- Never use H2 or any in-memory database substitute. Integration tests use real MySQL via Testcontainers.
+- Never use H2 or any in-memory database substitute. Integration tests use the locally installed MySQL.
+- **No Docker or container tools of any kind**: no Testcontainers, no Dockerfiles, no docker-compose.
+- Stock-event tests call the event listener directly; they never need RabbitMQ running.
+- Image and CSV file bytes are stored in MySQL (`stored_file`) and accessed only through the file-storage interface, so storage can move to S3 later without touching other code.
 - Money is `BigDecimal` in Java and `DECIMAL(12,2)` in MySQL, and a decimal string in JSON. Never `double` or `float`.
 - All timestamps are UTC. Code gets the current time from an injected `Clock`, never `now()` directly.
 - Every write records audit rows in the same transaction (from T-06 onwards).
 - Endpoints, status codes, field names and the error format must match Part 2 exactly.
 
 ## Commands
-<!-- Fill in after T-01: build, run, run tests, run one test -->
+Use the Maven Wrapper (no global Maven needed). On Windows use `mvnw.cmd`, elsewhere `./mvnw`.
+- Build + all tests (unit `*Test` and integration `*IT`): `./mvnw verify`
+- Unit tests only (fast): `./mvnw test`
+- One unit test: `./mvnw test -Dtest=CatalogApplicationTest#T01_contextLoads`
+- One integration test: `./mvnw verify -Dtest=none -Dsurefire.failIfNoSpecifiedTests=false -Dit.test=HealthCheckIT#T01_healthCheckReturnsUp`
+- Run locally: `./mvnw spring-boot:run -Dspring-boot.run.profiles=local`
+- Run the jar: `java -jar target/catalog-0.1.0-SNAPSHOT.jar --spring.profiles.active=prod`
+- Health check: `curl http://localhost:8080/actuator/health` → `{"status":"UP",...}`
+- Profiles: `local` (dev machine), `test` (automated tests), `prod`. No default profile; always pick one.
+- From T-02 on, the locally installed MySQL must be running for integration tests (database `catalog_test`).

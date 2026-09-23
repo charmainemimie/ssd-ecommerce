@@ -13,7 +13,7 @@ This single document is the source of truth for the catalog module. Requirement 
 - **Part 1 — Requirements:** how to read IDs, scope, glossary, roles, functional requirements (CAT-FR-001 to 101), non-functional requirements, out of scope, decisions log
 - **Part 2 — API Contract:** conventions, public, admin and internal endpoints, traceability
 - **Part 3 — Data Model:** size estimate, conventions, ER diagrams, table definitions, design decisions, app-enforced rules, indexes, traceability, stock sync decision
-- **Part 4 — Test Specification:** approach, fixtures, 104 test cases traced to requirement IDs, coverage summary
+- **Part 4 — Test Specification:** approach, fixtures, 107 test cases traced to requirement IDs, coverage summary
 - **Part 5 — Implementation Plan:** way of working, definition of done, 29 tasks in 6 milestones, each mapped to its requirements and tests
 
 ---
@@ -156,9 +156,12 @@ The catalog **does not** process orders, reserve stock, or apply promotions. Tho
 
 #### 4.7 Media
 
-**CAT-FR-060 — Images.** Image files live in object storage (e.g. S3). The catalog stores each image's URL, alt text (for accessibility), and position. Exactly one image per product is primary. Images can optionally be linked to specific variants, so picking "Blue" shows blue photos.
+**CAT-FR-060 — Images.** Image files are stored in MySQL (D29). The catalog stores each image's file, alt text (for accessibility), and position. Exactly one image per product is primary. Images can optionally be linked to specific variants, so picking "Blue" shows blue photos.
 
-**CAT-FR-061 — Image limits.** Allowed formats are JPEG, PNG and WebP, with a maximum of 10 MB per file and 20 images per product. Video is out of scope.
+**CAT-FR-061 — Image limits.** Allowed formats are JPEG, PNG and WebP, with a maximum of 10 MB per file and 20 images per product. The format is checked from the file's contents, not just its name. Video is out of scope.
+
+**CAT-FR-062 — Image delivery.** Each image is served at a permanent URL that never changes; replacing an image means uploading a new one with a new URL. Browsers are told to keep images for a year, so each shopper downloads each image once. Shoppers can only fetch images of Active products; staff can view any image.
+- AC1: *Given* an image of a Draft product, *when* a shopper requests it, *then* it is not found; *when* an editor requests it through the admin API, *then* it is returned.
 
 #### 4.8 URLs and slugs
 
@@ -181,7 +184,7 @@ The catalog **does not** process orders, reserve stock, or apply promotions. Tho
 
 #### 4.10 Bulk import
 
-**CAT-FR-090 — CSV import.** Admins can upload a CSV of up to 10,000 rows. Rows are matched by SKU: an existing SKU is updated, a new SKU is created.
+**CAT-FR-090 — CSV import.** Admins can upload a CSV of up to 10,000 rows and 15 MB. Rows are matched by SKU: an existing SKU is updated, a new SKU is created.
 
 **CAT-FR-091 — Import runs in the background.** The upload returns immediately with a job ID. The admin can check the job's progress and final result.
 
@@ -234,7 +237,7 @@ Full-text search, reviews and ratings, recommendations, cart, checkout, orders, 
 | D13 | Editors can publish; only admins manage categories, brands, templates and imports | Accepted default |
 | D14 | Physical goods only; brands yes, tags no | Accepted default |
 | D15 | Draft → Active → Archived, no hard deletes, audit history kept | Accepted default |
-| D16 | Images in object storage; catalog stores ordered URLs with one primary | Accepted default |
+| D16 | Images stored with an order and one primary per product (storage location replaced by D29) | Accepted default |
 | D17 | No full-text search in v1; browse, filter and sort only | Accepted default |
 | D18 | A sale is active from its start time (inclusive) until its end time (exclusive) | Confirmed |
 | D19 | Slug generation: lowercase, accents removed, anything not a letter or digit becomes a single hyphen, trimmed, max 140 characters | Confirmed |
@@ -246,7 +249,9 @@ Full-text search, reviews and ratings, recommendations, cart, checkout, orders, 
 | D25 | Stock sync (closes Q1): inventory **pushes** absolute stock levels as events; the catalog applies an event only if it is newer than what it holds, and runs a full reconciliation every 15 minutes and at startup as a safety net | Confirmed |
 | D26 | "Inventory unreachable" (CAT-FR-044) is detected by a heartbeat that inventory sends every 30 seconds, not by the age of each variant's stock value | Confirmed |
 | D27 | Event transport: a RabbitMQ queue while inventory runs as a separate service; in-process Spring events if both modules are deployed as one application. Catalog logic is identical either way | Confirmed |
-| D28 | Build setup: Spring Boot 4.1 (current release line), Java 21 LTS, Maven. Maven over Gradle: more common in Spring teams and its XML build file is simpler to read; Gradle builds faster but its scripted builds are harder to review | Confirmed |
+| D28 | No Docker or other container tools anywhere in the project. Tests run against a locally installed MySQL, the only service the project needs (see D29). Stock-event tests feed events straight to the catalog's listener, so no message broker is installed for testing | Confirmed |
+| D29 | Image files and uploaded import CSVs are stored in MySQL (`stored_file` table), behind a storage interface so they can move to S3 later without changing other code. Images are served by the API with year-long browser caching | Confirmed |
+| D30 | Build setup: Spring Boot 4.1 (current release line), Java 21 LTS, Maven. Maven over Gradle: more common in Spring teams and its XML build file is simpler to read; Gradle builds faster but its scripted builds are harder to review | Confirmed |
 
 ---
 
@@ -267,6 +272,14 @@ Every path starts with `/v1`. A breaking change means a new `/v2` path, while `/
 | `/v1/internal/...` | Other backend modules (orders, inventory) | Service-to-service credentials, not reachable from the internet |
 
 Splitting admin paths out lets the gateway require login for everything under `/admin` in one rule, instead of checking endpoint by endpoint.
+
+#### Operational endpoints (T-01)
+
+| Path | Purpose | Authentication |
+|---|---|---|
+| `GET /actuator/health` | Liveness/readiness for load balancers and orchestration. Returns `200` with `{"status":"UP"}` when healthy, `503` with `{"status":"DOWN"}` otherwise. | None needed (T-05 must let it through) |
+
+This path sits outside `/v1` on purpose: it is not part of the versioned business API and does not use the shared error format. Health details (component breakdown) are shown only in the `local` profile, never in production, so the endpoint reveals nothing about internals to the internet.
 
 #### How products are identified
 Public endpoints use the **slug**, because that is what appears in shopper-facing URLs. Admin and internal endpoints use a permanent **ID**, because slugs change when products are renamed (CAT-FR-071).
@@ -314,9 +327,12 @@ Cursor pagination doesn't skip or repeat items when products are added while a s
 | `400 Bad Request` | Malformed request: wrong types, unknown currency |
 | `401 Unauthorized` | Not logged in |
 | `403 Forbidden` | Logged in, but the role isn't allowed |
+| `304 Not Modified` | Browser already has the current version of an image (P7) |
 | `404 Not Found` | Doesn't exist (also used for Draft products on public endpoints) |
 | `409 Conflict` | Edit conflict, duplicate SKU, or deleting something still in use |
 | `410 Gone` | Archived product viewed by a shopper (CAT-FR-052) |
+| `413 Payload Too Large` | Uploaded file over its size limit (image 10 MB, CSV 15 MB) |
+| `415 Unsupported Media Type` | Uploaded file isn't an allowed format |
 | `422 Unprocessable Entity` | Well-formed request that breaks a business rule, e.g. publishing without a EUR price |
 
 `400` means "I can't read what you sent"; `422` means "I understood it, but it isn't allowed". This tells the frontend whether it has a bug or the user has a fixable mistake.
@@ -333,6 +349,7 @@ Cursor pagination doesn't skip or repeat items when products are added while a s
 | P4 | `GET /v1/categories` | Full category tree for navigation | 020 |
 | P5 | `GET /v1/categories/{slug}` | One category plus its filterable attributes | 010, 081 |
 | P6 | `GET /v1/brands` | Brand list | 023 |
+| P7 | `GET /v1/images/{imageId}` | Image file (Active products only) | 062 |
 
 #### P1 query parameters
 
@@ -363,7 +380,7 @@ P2 takes the same filters as P1 and returns counts like "Brand: Acme (42)". Coun
 | `breadcrumb` | Path through the **primary** category, e.g. Electronics › Laptops › Gaming (CAT-FR-021) |
 | `attributes` | Name, value, unit |
 | `options` | e.g. Size: [S, M, L]; Color: [Blue, Red] |
-| `images` | Ordered list: URL, alt text, `isPrimary`, linked variant IDs (CAT-FR-060) |
+| `images` | Ordered list: URL (a P7 link), alt text, `isPrimary`, linked variant IDs (CAT-FR-060) |
 | `variants` | Active variants only, each with SKU, option values, `price`, `availability` |
 
 #### Price object (CAT-FR-032)
@@ -420,14 +437,17 @@ Publishing runs the full validation in CAT-FR-051, so it gets its own endpoint r
 
 | # | Method and path | Purpose | Requirements |
 |---|---|---|---|
-| A12 | `POST /v1/admin/uploads` | Get a temporary upload URL | 060, 061 |
-| A13 | `POST /v1/admin/products/{id}/images` | Attach an uploaded image (URL, alt text, variant links) | 060 |
+| A12 | `POST /v1/admin/products/{id}/images` | Upload an image: file, alt text, optional variant links, in one request | 060, 061 |
+| A13 | `PUT /v1/admin/products/{id}/images/{imageId}` | Change alt text and variant links | 060 |
 | A14 | `PUT /v1/admin/products/{id}/images/order` | Reorder images and set the primary one | 060 |
 | A15 | `DELETE /v1/admin/products/{id}/images/{imageId}` | Remove an image | 060 |
+| A26 | `GET /v1/admin/images/{imageId}` | Image file for any product, including drafts (staff preview) | 062 |
 
-Uploads use a **pre-signed URL**: a temporary, one-time link that lets the browser upload straight to object storage (e.g. S3) without permanent credentials. A12 checks file type and size (CAT-FR-061) and returns the link; the browser uploads directly; A13 records the image on the product.
+Editors upload images **straight to the API** in one request carrying the file, alt text and optional variant links. A12 checks the format from the file's actual contents, not just its name, and the size (CAT-FR-061), then saves it in MySQL (D29).
 
-*Trade-off:* routing image bytes through the Spring Boot server is simpler to build, but ties up the API with large, slow uploads for no benefit.
+*Trade-off:* with object storage, browsers could upload directly to storage through a temporary link, keeping large uploads off the API. With images in MySQL that shortcut doesn't exist, and it isn't needed: only staff upload images, a few at a time, so the extra load on the API is small.
+
+**Serving images (P7, CAT-FR-062).** An image's URL never changes, because replacing an image means uploading a new one with a new ID. So P7 tells browsers to keep each image for a year (`Cache-Control: public, max-age=31536000, immutable`) and sends an `ETag`, a fingerprint of the file. A browser that checks again gets a tiny `304 Not Modified` instead of the whole file. Each shopper's browser downloads each image once, and a CDN (content delivery network, a service that caches files close to users) can be put in front of P7 later without any code changes. P7 serves only images of Active products; staff preview any image through A26.
 
 #### Categories, attributes, brands (Admin only)
 
@@ -483,7 +503,7 @@ I2 exists because checkout needs every cart item at once: one call for 20 items 
 | 030–034 | A6, P1, P3 |
 | 040–044 | P1, P3, A3 |
 | 050–053 | A7–A11, P3 |
-| 060–061 | A12–A15, P3 |
+| 060–062 | A12–A15, A26, P3, P7 |
 | 070–071 | A1, A4, P3 |
 | 080–084 | P1, P2, A2 |
 | 090–093 | A22–A24 |
@@ -501,7 +521,8 @@ I2 exists because checkout needs every cart item at once: one call for 20 items 
 **Not in this database:**
 - **Users and roles** live in the identity provider. Tables store the user's ID as text (`created_by`, `changed_by`).
 - **Stock quantities** are owned by the inventory module. The catalog keeps a *snapshot* only, for display and for the "last known value" fallback (CAT-FR-044).
-- **Image files** live in object storage. The catalog stores their location and metadata.
+
+Image files and uploaded import CSVs **are** stored in this database, in `stored_file` (D29, DM-13).
 
 ---
 
@@ -516,8 +537,9 @@ I2 exists because checkout needs every cart item at once: one call for 20 items 
 | Images | 60,000 | ~6 per product |
 | Categories | a few hundred | 4 levels max |
 | Audit rows | ~200,000 per year | Grows over time; bulk imports cause spikes |
+| Image files (bytes) | ~15–30 GB | ~6 images per product at 250–500 KB each; up to 10 MB allowed per image |
 
-Everything except the audit log fits in a few hundred MB, small enough for MySQL to keep almost entirely in memory. **One primary database is enough; no sharding is needed.** A read replica can be added later to meet the 99.9% availability target (CAT-NFR-004); that is an infrastructure decision and doesn't change this model.
+Catalog data (everything except image files and the audit log) fits in a few hundred MB, small enough for MySQL to keep almost entirely in memory. Image files dominate storage at 15–30 GB. That's fine for MySQL, and because browsers cache images for a year (P7) they are read rarely, so they don't crowd the catalog data out of memory. The main cost is backup size and time (DM-13). **One primary database is enough; no sharding is needed.** A read replica can be added later to meet the 99.9% availability target (CAT-NFR-004); that is an infrastructure decision and doesn't change this model.
 
 ---
 
@@ -654,22 +676,23 @@ A product with no options has no `product_option` rows and one variant with `opt
 │ PK id               │        ├──────────────────────────┤        │ PK id        │
 └─────────────────────┘        │ PK id                    │        └──────┬───────┘
                                │ FK product_id            │               ┼
-                               │    storage_key, url      │               │
-                               │    alt_text              │               │
-                               │    content_type          │               │
-                               │    size_bytes            │               │
-                               │ UQ (product_id, position)│               │
-                               │ UQ primary_marker        │               │
-                               └────────────┬─────────────┘               │
-                                            ┼                             │
-                                            │                             │
-                                           o<                            o<
-                               ┌────────────┴─────────────────────────────┴───┐
+┌─────────────────────┐        │ FK,UQ file_id            │               │
+│ stored_file         │┼─────o┼│    alt_text              │               │
+├─────────────────────┤        │    position, is_primary  │               │
+│ PK id               │        │ UQ (product_id, position)│               │
+│    purpose          │        │ UQ primary_marker        │               │
+│    content_type     │        └────────────┬─────────────┘               │
+│    size_bytes       │                     ┼                             │
+│    sha256           │                     │                             │
+│    content (BLOB)   │                    o<                            o<
+└─────────────────────┘        ┌────────────┴─────────────────────────────┴───┐
                                │ product_image_variant                        │
                                ├──────────────────────────────────────────────┤
                                │ PK,FK image_id                               │
                                │ PK,FK variant_id                             │
                                └──────────────────────────────────────────────┘
+
+ stored_file also holds uploaded import CSVs: import_job.file_id → stored_file.id
 ```
 
 #### 4E. Operations: imports, audit, listing read model
@@ -680,7 +703,7 @@ A product with no options has no `product_option` rows and one variant with `opt
 ├────────────────────┤        ├─────────────────────────┤
 │ PK id              │        │ PK id                   │
 │    status          │        │ FK import_job_id        │
-│    file_storage_key│        │    row_number, sku      │
+│ FK file_id         │        │    row_number, sku      │
 │    total_rows      │        │    field, error_code    │
 │    processed_rows  │        │    message              │
 │    *_count         │        └─────────────────────────┘
@@ -918,11 +941,8 @@ A single-row table describing the health of the link to inventory.
 |---|---|---|---|
 | id | BIGINT UNSIGNED | No | PK |
 | product_id | BIGINT UNSIGNED | No | FK |
-| storage_key | VARCHAR(512) | No | Object storage location |
-| url | VARCHAR(1024) | No | Public URL |
+| file_id | BIGINT UNSIGNED | No | FK → stored_file.id. UQ: each file belongs to one image |
 | alt_text | VARCHAR(250) | No | Accessibility text |
-| content_type | ENUM | No | `image/jpeg`, `image/png`, `image/webp` |
-| size_bytes | INT UNSIGNED | No | CHECK ≤ 10 MB |
 | position | SMALLINT | No | |
 | is_primary | BOOLEAN | No | |
 | primary_marker | BIGINT UNSIGNED | Yes | **Generated**: `product_id` when primary, otherwise empty. UQ (DM-7) |
@@ -932,7 +952,25 @@ Unique: `(product_id, position)`, `primary_marker`.
 
 **`product_image_variant`**: `image_id` + `variant_id`, both PK parts and FKs.
 
-Removing an image (A15) deletes its row; the removal is recorded in `audit_log`. This is the one deliberate hard delete.
+The public URL isn't stored; it's always `/v1/images/{id}` (P7).
+
+Removing an image (A15) deletes its `product_image` row and its `stored_file` row in one transaction; the removal is recorded in `audit_log`. This is the one deliberate hard delete.
+
+#### 5.15a `stored_file` — CAT-FR-060, 061, 062, 090 (D29)
+
+Holds the actual bytes of image files and uploaded import CSVs. Other tables point to it; nothing else stores file contents.
+
+| Column | Type | Null | Notes |
+|---|---|---|---|
+| id | BIGINT UNSIGNED | No | PK |
+| purpose | ENUM | No | `PRODUCT_IMAGE`, `IMPORT_CSV` |
+| content_type | VARCHAR(100) | No | Detected from the file's contents, e.g. `image/webp`, `text/csv` |
+| size_bytes | INT UNSIGNED | No | CHECK ≤ 10 MB for images, ≤ 15 MB for CSVs |
+| sha256 | CHAR(64) | No | Fingerprint of the contents. Used as the `ETag` in P7 and to detect corruption |
+| content | MEDIUMBLOB | No | The file itself. `MEDIUMBLOB` holds up to 16 MB, above both limits |
+| created_at, created_by | | No | |
+
+MySQL setting: `max_allowed_packet` must be at least 32 MB so a full file fits in one request. MySQL 8's default of 64 MB already covers this; the check just stops anyone lowering it.
 
 #### 5.16 `product_listing` — read model for CAT-FR-034, 080–084
 
@@ -960,7 +998,7 @@ Indexes: `(currency_code, published_at, product_id)`, `(currency_code, from_pric
 |---|---|---|---|
 | id | BIGINT UNSIGNED | No | PK (the `jobId`) |
 | status | ENUM | No | `QUEUED`, `RUNNING`, `COMPLETED`, `FAILED` |
-| file_storage_key | VARCHAR(512) | No | Uploaded CSV in object storage |
+| file_id | BIGINT UNSIGNED | No | FK → stored_file.id: the uploaded CSV (D29) |
 | total_rows, processed_rows | INT | No | Progress |
 | created_count, updated_count, failed_count | INT | No | |
 | failure_reason | VARCHAR(500) | Yes | Whole-job failure only (e.g. unreadable file) |
@@ -1044,6 +1082,15 @@ The application's database user gets only insert and read permission on `audit_l
 **DM-12 — One version number per product.**
 The API checks conflicts at product level (CAT-FR-004), so `product.version` increases whenever the product *or anything under it* changes (variants, prices, options, attributes, images). A save only succeeds if the version it was based on is still current. Spring's JPA layer supports this pattern ("optimistic locking") out of the box.
 
+**DM-13 — Files stored in MySQL (D29).**
+Image files and import CSVs are stored in the `stored_file` table instead of object storage such as S3. This keeps MySQL as the only service the project needs, and keeps files in the same transactions and backups as the data that refers to them, so a product can never point at a missing file.
+*Costs:* the database grows by roughly 15–30 GB, so backups are larger and slower; and every image passes through the API instead of coming straight from a storage service.
+*How the costs are kept small:*
+- File bytes live in their own table, so product queries never load them by accident.
+- Images are served with year-long browser caching and an `ETag` (P7), so each browser fetches each image once, and a CDN can be added later.
+- All file access goes through one storage interface in the code, with MySQL as its only implementation. If the database becomes too heavy, moving files to S3 means writing a second implementation and migrating the bytes; products, the API and the tests don't change.
+*Alternative:* object storage (S3 or a compatible service) is the standard choice at larger scale and keeps the database small, but needs a second service installed and running, which this project avoids.
+
 ---
 
 ### 7. Rules the database can't enforce (application responsibility)
@@ -1058,6 +1105,9 @@ The API checks conflicts at product level (CAT-FR-004), so `product.version` inc
 | A category can't redefine an attribute code it inherits; depth and `path` stay consistent when categories move | CAT-FR-011, 020 |
 | Attribute values match their definition's data type; single-select has one row | CAT-FR-012 |
 | At most 20 images per product | CAT-FR-061 |
+| File format is detected from the contents, not the file name or the header the client sends | CAT-FR-061 |
+| Removing an image removes its `stored_file` row in the same transaction | CAT-FR-060 |
+| P7 serves only images whose product is Active | CAT-FR-062 |
 | Every product has exactly one current slug; renaming inserts a new current slug and marks the old one as not current | CAT-FR-070, 071 |
 | `product_category` includes the primary category | CAT-FR-021 |
 | `product.version` bumps on any child change | CAT-FR-004 |
@@ -1079,6 +1129,7 @@ The API checks conflicts at product level (CAT-FR-004), so `product.version` inc
 | A25 product history | audit_log | `(product_id, changed_at, id)` |
 | Sale start/end scheduler | variant | `(sale_starts_at)`, `(sale_ends_at)` |
 | Import worker picks next job | import_job | `(status, created_at)` |
+| P7 serve an image | product_image → product (status) → stored_file | `product_image` PK, `stored_file` PK |
 
 ---
 
@@ -1099,6 +1150,7 @@ The API checks conflicts at product level (CAT-FR-004), so `product.version` inc
 | variant_stock_snapshot | 040, 041, 042, 043, 044 |
 | inventory_sync_status | 044 |
 | product_image, product_image_variant | 060, 061 |
+| stored_file | 060, 061, 062, 090 |
 | product_listing | 034, 080, 081, 083, 084 |
 | import_job, import_job_error | 090, 091, 092, 093 |
 | audit_log | 100, 101 |
@@ -1141,7 +1193,17 @@ Format: `TC-CAT-{requirement number}-{nn}`, e.g. `TC-CAT-001-02` is the second t
 | **T** | Time-based | Behaviour that depends on the clock or on background jobs | Every build, with a controllable clock |
 | **P** | Performance | Speed and load targets on a production-sized dataset | Nightly or before release |
 
-**Real MySQL, not an in-memory substitute.** Integration tests start a real MySQL 8 instance in Docker using Testcontainers (a library that manages throwaway databases for tests). The common alternative, the H2 in-memory database, is faster to start, but it doesn't behave like MySQL for things this design depends on: `CHECK` constraints, generated columns, unique indexes that ignore empty values, and collation rules. A test passing on H2 could fail in production.
+**Real MySQL, not an in-memory substitute.** Integration tests always run against a real MySQL 8. The common alternative, the H2 in-memory database, is faster to start, but it doesn't behave like MySQL for things this design depends on: `CHECK` constraints, generated columns, unique indexes that ignore empty values, and collation rules. A test passing on H2 could fail in production.
+
+**Real services installed on the machine, no containers (D28).** The project uses no Docker or other container tools. MySQL is the only service the project needs, since image files are stored in it too (D29). Tests use a MySQL installed directly on the developer's machine:
+
+| Service | Needed from | Used for | Fresh state |
+|---|---|---|---|
+| MySQL 8 | T-02 | All integration and API tests, in a dedicated database `catalog_test` | The test harness wipes and re-migrates `catalog_test` at the start of each run |
+
+**No message broker for tests.** RabbitMQ only carries stock events between separately running services (D27). The catalog's logic sits behind an event listener, so tests hand events straight to that listener (fixture F-STOCK) and exercise exactly the same code. RabbitMQ is only installed when running the catalog end-to-end with a separate inventory service.
+
+*Trade-off:* Testcontainers would give every run brand-new, isolated services and make a future CI (continuous integration) server self-contained. Without containers, the developer installs MySQL once, and any CI server must have it installed too. Since one database is shared across a run, every test cleans up after itself or uses its own data, as the "independent tests" rule below already requires.
 
 **A controllable clock.** Code that asks "what time is it?" (sales, stock freshness) gets the time from an injected clock instead of the system clock. Tests set the clock to "3 December" directly rather than waiting, so time-based tests are instant and repeatable.
 
@@ -1265,8 +1327,11 @@ Tests refer to these by name instead of repeating setup.
 | TC-CAT-060-01 | FR-060 | I | Mark a second image as primary | New image primary, old one not; never two at once |
 | TC-CAT-060-02 | FR-060 | A | Link an image to `TEE-S-BLU` and `TEE-M-BLU` | P3 returns the image with both variant IDs |
 | TC-CAT-060-03 | FR-060 | I | Reorder images | Positions saved; P3 returns the new order |
-| TC-CAT-061-01 | FR-061 | A | Request upload URLs for a GIF, and for an 11 MB JPEG | Both rejected |
+| TC-CAT-060-04 | FR-060 | I | Upload an image to F-TEE (A12), then remove it (A15) | Upload creates one `product_image` and one `stored_file` row; removal deletes both |
+| TC-CAT-061-01 | FR-061 | A | Upload a GIF; an 11 MB JPEG; a text file renamed to `.jpg` | `415`; `413`; `415`. Nothing saved |
 | TC-CAT-061-02 | FR-061 | I | Attach a 21st image | `422` |
+| TC-CAT-062-01 | FR-062 | A | Shopper fetches F-TEE's primary image (P7), then again sending the `ETag` it received | First: `200`, correct content type, bytes identical to the upload, year-long cache header. Second: `304` with no body |
+| TC-CAT-062-02 | FR-062 AC1 | A | Image of a Draft product: shopper requests it via P7; editor via A26 | P7 `404`; A26 `200` |
 
 ### 3.8 URLs and slugs
 
@@ -1300,7 +1365,7 @@ Tests refer to these by name instead of repeating setup.
 | Test ID | Covers | Level | Scenario | Expected |
 |---|---|---|---|---|
 | TC-CAT-090-01 | FR-090 | I | CSV with one new SKU and one existing SKU | New one created; existing one updated |
-| TC-CAT-090-02 | FR-090 | A | CSV with 10,001 rows | Rejected at upload; no job created |
+| TC-CAT-090-02 | FR-090 | A | CSV with 10,001 rows; CSV over 15 MB | Both rejected at upload; no job created |
 | TC-CAT-090-03 | FR-090 | A | Editor uploads a CSV | `403` |
 | TC-CAT-091-01 | FR-091 | T | Upload a valid CSV; poll the job | `202` with `jobId` immediately; status moves `QUEUED` → `RUNNING` → `COMPLETED` with counts |
 | TC-CAT-092-01 | FR-092 AC1 | I | 100 rows; row 37 has no EUR price | 99 saved; report: row 37, `PRICE_EUR_MISSING` |
@@ -1345,13 +1410,13 @@ For the performance tests, a load-testing tool such as Gatling or k6 replays the
 | Pricing | 030–034 | 10 |
 | Stock display | 040–044 | 10 |
 | Lifecycle | 050–053 | 9 |
-| Media | 060–061 | 5 |
+| Media | 060–062 | 8 |
 | Slugs | 070–071 | 5 |
 | Browse, filter, sort | 080–084 | 12 |
 | Bulk import | 090–093 | 8 |
 | Audit | 100–101 | 5 |
 | Non-functional | NFR-001–008 | 10 |
-| **Total** | | **104** |
+| **Total** | | **107** |
 
 Every functional requirement has at least one test. NFR-004 is verified by production monitoring rather than a build test.
 
@@ -1414,18 +1479,18 @@ Spring Boot application with packages split by feature rather than by layer: `br
 
 **T-02 — Database migrations** · S · Depends on: T-01
 Set up Flyway to apply versioned schema files in order, and seed the `currency` table with EUR and USD. *Trade-off:* Liquibase is the main alternative. It can target several database types and generate rollbacks, but it describes changes in XML or YAML. This project only uses MySQL, and Flyway's plain SQL files are easier to read and review.
-*Done when:* migrations apply cleanly to an empty MySQL started by Testcontainers.
+*Done when:* migrations apply cleanly to an empty `catalog_test` database on a local MySQL.
 
 **T-03 — Test harness** · M · Depends on: T-02
-Shared base for integration and API tests with a real MySQL container; injectable clock; fake inventory client; builders for fixtures F-TREE to F-CLOCK; the coverage gate script that compares requirement IDs in this document with test IDs in the code. At first the gate only *reports* uncovered requirements; T-29 makes it fail the build.
-*Done when:* an empty sample test runs on the container; the coverage report lists every requirement as uncovered.
+Shared base for integration and API tests against a locally installed MySQL (D28): connection details come from test configuration, and `catalog_test` is wiped and re-migrated before each run; injectable clock; fake inventory client; builders for fixtures F-TREE to F-CLOCK; the coverage gate script that compares requirement IDs in this document with test IDs in the code. At first the gate only *reports* uncovered requirements; T-29 makes it fail the build.
+*Done when:* a sample test passes against the locally installed MySQL with no container tools present; the coverage report lists every requirement as uncovered.
 
 **T-04 — API conventions** · M · Depends on: T-01
 `/v1` prefix, the shared error format with `traceId`, mapping of errors to `400` / `409` / `422` (including D24), money written as decimal strings, currency parameter handling, rejection of unknown fields.
 *Requirements:* NFR-007 · *Tests:* TC-CAT-NFR-007-01
 
 **T-05 — Security** · M · Depends on: T-04
-Login through the identity provider using signed tokens (JWT, JSON Web Tokens: a tamper-proof token stating who the user is and their roles). Roles Editor and Admin, service credentials for `/internal`, and path rules for the three audiences. The permission test is written to run against *every* endpoint automatically, so each new endpoint is covered as it's added.
+Login through the identity provider using signed tokens (JWT, JSON Web Tokens: a tamper-proof token stating who the user is and their roles). Roles Editor and Admin, service credentials for `/internal`, and path rules for the three audiences, plus open access to the operational health endpoint (Part 2 §1). The permission test is written to run against *every* endpoint automatically, so each new endpoint is covered as it's added.
 *Requirements:* NFR-006 · *Tests:* TC-CAT-NFR-006-01
 
 **T-06 — Audit infrastructure** · M · Depends on: T-02
@@ -1465,8 +1530,8 @@ Any change to variants, prices, options, attributes or images increases the prod
 *Requirements:* FR-004 · *Tests:* TC-CAT-004-02
 
 **T-14 — Images** · M · Depends on: T-10
-Pre-signed upload URLs with type and size checks (A12), attach (A13), reorder and primary (A14), remove (A15), variant links, 20-image limit. Tests use MinIO, an S3-compatible storage server that runs in Docker, so no real cloud account is needed.
-*Requirements:* FR-060, 061 · *Tests:* TC-CAT-060-01, 061-01, 061-02
+The `stored_file` table and a file-storage interface with MySQL as its only implementation (D29, DM-13). Upload straight to the API with format and size checks (A12), alt text and variant links (A13), reorder and primary (A14), remove (A15), 20-image limit. Image delivery with year-long caching and `ETag` (P7, A26). Spring Boot limits uploads to 1 MB by default; raise it to 16 MB.
+*Requirements:* FR-060, 061, 062 · *Tests:* TC-CAT-060-01, 060-04, 061-01, 061-02, 062-01, 062-02
 
 **T-15 — Lifecycle and publish rules** · L · Depends on: T-11, T-12, T-14
 Publish, archive and restore actions (A9–A11) with the allowed transitions (D20); full publish validation returning every problem at once; SKU freeze after first publish; "an Active product stays valid" on every edit, including the last-variant rule.
@@ -1477,7 +1542,7 @@ Publish, archive and restore actions (A9–A11) with the allowed transitions (D2
 ### M3 — Stock and storefront
 
 **T-16 — Stock snapshot** · M · Depends on: T-11
-`variant_stock_snapshot` and `inventory_sync_status` tables; consumer for "stock changed" events that ignores older or repeated ones; heartbeat tracking; 15-minute and startup reconciliation (Part 3, section 10). Admin detail shows exact quantities.
+`variant_stock_snapshot` and `inventory_sync_status` tables; consumer for "stock changed" events that ignores older or repeated ones; heartbeat tracking; 15-minute and startup reconciliation (Part 3, section 10). Admin detail shows exact quantities. Tests hand events straight to the catalog's listener, so no RabbitMQ is needed to run them (D28). The RabbitMQ connection itself is configuration, used only when a separate inventory service exists.
 *Requirements:* FR-040, 042, 044 · *Tests:* TC-CAT-040-02, 040-03, 042-01
 
 **T-17 — Product detail page** · L · Depends on: T-15, T-16
@@ -1508,8 +1573,8 @@ A2 with numbered pages, status/category/brand filters, and search by name or SKU
 
 ### M4 — Bulk import and history
 
-**T-23 — Import upload and jobs** · M · Depends on: T-15
-A22 and A23: file checks, the 10,000-row limit, `import_job` table, a background worker that picks the oldest queued job, whole-file failure handling.
+**T-23 — Import upload and jobs** · M · Depends on: T-14, T-15
+A22 and A23: file checks, the 10,000-row and 15 MB limits, the uploaded CSV saved in `stored_file` (D29), `import_job` table, a background worker that picks the oldest queued job, whole-file failure handling.
 *Requirements:* FR-090, 091, 092 · *Tests:* TC-CAT-090-02, 090-03, 092-02
 
 **T-24 — Import row processing** · L · Depends on: T-23
@@ -1535,7 +1600,7 @@ Uptime checks on public reads, p95 response-time dashboards, and alerts.
 *Requirements:* NFR-004 · *Tests:* TC-CAT-NFR-004-01
 
 **T-29 — Release gate** · S · Depends on: all tasks
-The coverage gate now fails the build if any requirement lacks a test. All 104 tests pass. Spec, tests and code agree.
+The coverage gate now fails the build if any requirement lacks a test. All 107 tests pass. Spec, tests and code agree.
 *Done when:* all of the above hold.
 
 ## 4. Traceability: tests per task
@@ -1544,7 +1609,7 @@ The coverage gate now fails the build if any requirement lacks a test. All 104 t
 |---|---|---|---|---|---|
 | T-04 | 1 | T-12 | 4 | T-20 | 13 |
 | T-05 | 1 | T-13 | 1 | T-21 | 2 |
-| T-06 | 1 | T-14 | 3 | T-22 | 1 |
+| T-06 | 1 | T-14 | 6 | T-22 | 1 |
 | T-07 | 5 | T-15 | 11 | T-23 | 3 |
 | T-08 | 6 | T-16 | 3 | T-24 | 6 |
 | T-09 | 1 | T-17 | 16 | T-25 | 2 |
@@ -1552,4 +1617,4 @@ The coverage gate now fails the build if any requirement lacks a test. All 104 t
 | T-11 | 7 | T-19 | 3 | T-27 | 2 |
 | | | | | T-28 | 1 |
 
-**Total: 104**. Every test in Part 4 is assigned to exactly one task.
+**Total: 107**. Every test in Part 4 is assigned to exactly one task.

@@ -1,0 +1,11 @@
+# Developer machine. Verbose and transparent; never used in a deployed environment.
+# Database connection settings are added in T-02.
+management:
+  endpoint:
+    health:
+      # Show which components (db, disk, ...) are up; handy when debugging locally.
+      show-details: always
+
+logging:
+  level:
+    com.ssd.catalog: DEBUG

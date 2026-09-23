@@ -1,0 +1,29 @@
+# Settings shared by every profile. Profile files (local / test / prod) only
+# hold what genuinely differs between environments.
+spring:
+  application:
+    name: catalog
+  # No default profile on purpose: production must opt in explicitly with
+  # SPRING_PROFILES_ACTIVE=prod, and local runs pass -Dspring-boot.run.profiles=local.
+  jackson:
+    # All timestamps are UTC (CLAUDE.md, spec Part 2 "Timestamps"). Jackson 3
+    # (used by Boot 4) already writes dates as ISO 8601 strings by default, so
+    # only the zone needs pinning.
+    time-zone: UTC
+
+server:
+  # Let in-flight requests finish on shutdown instead of cutting them off
+  # mid-write (matters once writes + audit rows share a transaction).
+  shutdown: graceful
+
+management:
+  endpoints:
+    web:
+      exposure:
+        # Only the health endpoint is published over HTTP (spec Part 2 §1).
+        # Everything else actuator offers stays off the network.
+        include: health
+  endpoint:
+    health:
+      # Safe default: no component breakdown. The local profile turns it on.
+      show-details: never

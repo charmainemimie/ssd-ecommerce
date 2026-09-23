@@ -1,0 +1,17 @@
+# Production. Secrets (database password, JWT keys) come from environment
+# variables or the platform's secret store, never from this file.
+management:
+  endpoint:
+    health:
+      # Reveal only UP/DOWN to the internet, not which internal components exist.
+      show-details: never
+
+server:
+  error:
+    # Never leak stack traces or exception messages in error responses.
+    include-stacktrace: never
+    include-message: never
+
+logging:
+  level:
+    root: INFO

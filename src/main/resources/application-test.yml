@@ -1,0 +1,7 @@
+# Automated tests. From T-02 on, integration tests run against the locally
+# installed MySQL, database `catalog_test` (spec D28): never H2, never containers.
+# Connection settings are added in T-02/T-03.
+logging:
+  level:
+    root: WARN
+    com.ssd.catalog: INFO
